@@ -1268,6 +1268,119 @@ suite('types', function () {
       assert.strictEqual(t.getName(true), 'map');
     });
 
+    test('read sized block', function () {
+      var t = new builtins.MapType({type: 'map', values: 'int'});
+      // count = -1, size = 3, key "a" (length 1 + byte), int value 1.
+      var buf = utils.bufferFrom([1, 6, 2, 97, 2, 0]);
+      assert.deepEqual(t.fromBuffer(buf), {a: 1});
+    });
+
+    test('read multi blocks', function () {
+      var t = new builtins.MapType({type: 'map', values: 'int'});
+      // Positive block then sized block.
+      var buf = utils.bufferFrom([
+        2, 2, 97, 2,       // count = 1, key "a", value 1.
+        1, 6, 2, 98, 4, 0  // count = -1, size = 3, key "b", value 2.
+      ]);
+      assert.deepEqual(t.fromBuffer(buf), {a: 1, b: 2});
+    });
+
+    test('read truncated block size', function () {
+      var t = new builtins.MapType({type: 'map', values: 'int'});
+      assert.throws(function () {
+        t.fromBuffer(utils.bufferFrom([1])); // Negative count, no size.
+      }, /truncated/);
+    });
+
+    test('read negative block size', function () {
+      var t = new builtins.MapType({type: 'map', values: 'int'});
+      // count = -1, size = -1 (zigzag 1), key, value, terminator.
+      assert.throws(function () {
+        t.fromBuffer(utils.bufferFrom([1, 1, 2, 97, 2, 0]));
+      }, /invalid collection block size/);
+    });
+
+    test('read block size larger than buffer', function () {
+      var t = new builtins.MapType({type: 'map', values: 'int'});
+      // count = -1, size = 99, then a full valid block's worth of bytes.
+      var buf = utils.bufferFrom([1, 198, 1, 2, 97, 2, 0]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block size/);
+    });
+
+    test('read block size larger than content', function () {
+      var t = new builtins.MapType({type: 'map', values: 'int'});
+      // The block only contains 3 bytes ("a" -> 1) but declares 5. The extra
+      // declared bytes must not be swallowed from the terminator/next field.
+      var rec = Type.forSchema({
+        name: 'MapRec',
+        type: 'record',
+        fields: [
+          {name: 'map', type: {type: 'map', values: 'int'}},
+          {name: 'val', type: 'int'}
+        ]
+      });
+      var buf = utils.bufferFrom([1, 10, 2, 97, 2, 0, 6]);
+      assert.throws(function () { rec.fromBuffer(buf); }, /invalid collection block/);
+    });
+
+    test('read block size smaller than content', function () {
+      var t = new builtins.MapType({type: 'map', values: 'int'});
+      // Block content is 3 bytes but the size claims 2.
+      var buf = utils.bufferFrom([1, 4, 2, 97, 2, 0]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block/);
+    });
+
+    test('read block count inconsistent with content', function () {
+      var t = new builtins.MapType({type: 'map', values: 'int'});
+      // count = -2 but only a single 3-byte entry fits in the declared size.
+      var buf = utils.bufferFrom([3, 6, 2, 97, 2, 0]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block/);
+    });
+
+    test('read nested corrupt block', function () {
+      var t = Type.forSchema({
+        type: 'array',
+        items: {type: 'map', values: 'int'}
+      });
+      // Outer sized block wrapping an inner map whose declared size is bogus.
+      var inner = utils.bufferFrom([1, 198, 1, 2, 97, 2, 0]);
+      var buf = Buffer.concat([
+        utils.bufferFrom([1, inner.length]), inner, utils.bufferFrom([0])
+      ]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block size/);
+    });
+
+    test('resolve with strict sized blocks', function () {
+      var t1 = new builtins.MapType({type: 'map', values: 'int'});
+      var t2 = new builtins.MapType({type: 'map', values: 'long'});
+      var resolver = t2.createResolver(t1);
+      var buf = utils.bufferFrom([1, 6, 2, 97, 2, 0]); // Sized block.
+      assert.deepEqual(t2.fromBuffer(buf, resolver), {a: 1});
+      var bad = utils.bufferFrom([1, 198, 1, 2, 97, 2, 0]); // Bogus size.
+      assert.throws(function () {
+        t2.fromBuffer(bad, resolver);
+      }, /invalid collection block size/);
+    });
+
+    test('skip still consumes whole sized block', function () {
+      var v1 = Type.forSchema({
+        name: 'MapSkip',
+        type: 'record',
+        fields: [
+          {name: 'map', type: {type: 'map', values: 'int'}},
+          {name: 'val', type: 'int'}
+        ]
+      });
+      var v2 = Type.forSchema({
+        name: 'MapSkip',
+        type: 'record',
+        fields: [{name: 'val', type: 'int'}]
+      });
+      var resolver = v2.createResolver(v1);
+      var buf = utils.bufferFrom([1, 6, 2, 97, 2, 0, 6]); // Valid sized block.
+      assert.deepEqual(v2.fromBuffer(buf, resolver), {val: 3});
+    });
+
   });
 
   suite('ArrayType', function () {
@@ -1437,6 +1550,108 @@ suite('types', function () {
         t.fromBuffer(tap.buf.slice(0, tap.pos)),
         ['hi', 'hey', 'hello']
       );
+    });
+
+    test('read sized block', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'int'});
+      // count = -1, size = 2, int 1, terminator.
+      var buf = utils.bufferFrom([1, 2, 2, 0]);
+      assert.deepEqual(t.fromBuffer(buf), [1]);
+    });
+
+    test('read sized block of nulls with zero size', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'null'});
+      // count = -2, size = 0 (nulls take no bytes), terminator.
+      var buf = utils.bufferFrom([3, 0, 0]);
+      assert.deepEqual(t.fromBuffer(buf), [null, null]);
+    });
+
+    test('read mixed sized and unsized blocks', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'int'});
+      // Positive block of 2 ints, then a sized block of 1 int.
+      var buf = utils.bufferFrom([4, 2, 4, 1, 2, 6, 0]);
+      assert.deepEqual(t.fromBuffer(buf), [1, 2, 3]);
+    });
+
+    test('read truncated block size', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'int'});
+      assert.throws(function () {
+        t.fromBuffer(utils.bufferFrom([1])); // Negative count, missing size.
+      }, /truncated/);
+    });
+
+    test('read negative block size', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'int'});
+      // count = -1, size = -100 (multi-byte so the tap stays in bounds).
+      var buf = utils.bufferFrom([1, 199, 1, 2, 0]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block size/);
+    });
+
+    test('read block size larger than buffer', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'int'});
+      // count = -1, size = 99, a single int then terminator.
+      var buf = utils.bufferFrom([1, 198, 1, 2, 0]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block size/);
+    });
+
+    test('read block size larger than content', function () {
+      var rec = Type.forSchema({
+        name: 'ArrRec',
+        type: 'record',
+        fields: [
+          {name: 'arr', type: {type: 'array', items: 'int'}},
+          {name: 'val', type: 'int'}
+        ]
+      });
+      // The int only takes 1 byte but the block declares 4; the following
+      // field's bytes must not be consumed to fill the bad block.
+      var buf = utils.bufferFrom([1, 8, 2, 6, 0]);
+      assert.throws(function () { rec.fromBuffer(buf); }, /invalid collection block/);
+    });
+
+    test('read block size smaller than content', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'string'});
+      // The string "hi" takes 3 bytes (length + characters) but the block
+      // declares a size of only 1, so its boundary check fails.
+      var buf = utils.bufferFrom([1, 2, 4, 104, 105, 0]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block/);
+    });
+
+    test('read block count inconsistent with content', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'int'});
+      // count = -3 but only one int fits in the declared 1-byte block.
+      var buf = utils.bufferFrom([5, 2, 2, 0]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block/);
+    });
+
+    test('read nested corrupt block', function () {
+      var t = new builtins.ArrayType({
+        items: new builtins.ArrayType({items: 'int'})
+      });
+      // Inner array declares size 9 (zigzag 18) but only holds one int.
+      var inner = utils.bufferFrom([1, 18, 2, 0]);
+      var buf = Buffer.concat([
+        utils.bufferFrom([1, inner.length]), inner, utils.bufferFrom([0])
+      ]);
+      assert.throws(function () { t.fromBuffer(buf); }, /invalid collection block/);
+    });
+
+    test('resolve with strict sized blocks', function () {
+      var t1 = new builtins.ArrayType({type: 'array', items: 'int'});
+      var t2 = new builtins.ArrayType({type: 'array', items: 'long'});
+      var resolver = t2.createResolver(t1);
+      var buf = utils.bufferFrom([1, 2, 2, 0]); // Sized block.
+      assert.deepEqual(t2.fromBuffer(buf, resolver), [1]);
+      var bad = utils.bufferFrom([1, 198, 1, 2, 0]); // Bogus size.
+      assert.throws(function () {
+        t2.fromBuffer(bad, resolver);
+      }, /invalid collection block size/);
+    });
+
+    test('decode corrupt block invalidates tap', function () {
+      var t = new builtins.ArrayType({type: 'array', items: 'int'});
+      var buf = utils.bufferFrom([1, 198, 1, 2, 0]);
+      assert.throws(function () { t.decode(buf, 0); }, /invalid collection block size/);
     });
 
   });
