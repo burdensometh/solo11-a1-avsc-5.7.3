@@ -791,6 +791,218 @@ suite('containers', function () {
       decoder.end();
     });
 
+    test('async codec preserves order when blocks finish out of order', function (cb) {
+      var t = Type.forSchema('int');
+      var seq = 0;
+      function unorderedCodec(buf, done) {
+        var id = seq++;
+        // Even-indexed blocks are slow, odd ones fast, so blocks routinely
+        // complete in a different order than they were submitted.
+        setTimeout(function () { done(null, buf); }, id % 2 === 0 ? 30 : 2);
+      }
+      var encoder = new streams.BlockEncoder(t, {
+        blockSize: 1,
+        codec: 'unordered',
+        codecs: {unordered: unorderedCodec}
+      });
+      var decoder = new streams.BlockDecoder({
+        codecs: {unordered: unorderedCodec}
+      });
+      var vals = [];
+      decoder
+        .on('data', function (val) { vals.push(val); })
+        .on('end', function () {
+          var expected = [];
+          for (var i = 0; i < 12; i++) { expected.push(i); }
+          assert.deepEqual(vals, expected);
+          cb();
+        });
+      encoder.on('error', cb);
+      decoder.on('error', cb);
+      encoder.pipe(decoder);
+      for (var j = 0; j < 12; j++) { encoder.write(j); }
+      encoder.end();
+    });
+
+    test('bounds in-flight and buffered block counts', function (cb) {
+      var t = Type.forSchema('int');
+      var maxBlocks = 3;
+      var maxHeld = 0;
+      var encoder = new streams.BlockEncoder(t, {
+        blockSize: 1,
+        codec: 'async',
+        codecs: {async: function (buf, done) {
+          setTimeout(function () { done(null, buf); }, 5);
+        }},
+        maxBlocks: maxBlocks
+      });
+      var decoder = new streams.BlockDecoder({
+        codecs: {async: function (buf, done) {
+          setTimeout(function () { done(null, buf); }, 5);
+        }}
+      });
+      var slow = new stream.Writable({
+        objectMode: true,
+        highWaterMark: 4,
+        write: function (chunk, enc, done) { setTimeout(done, 20); }
+      });
+      var sampler = setInterval(function () {
+        var d = encoder._dispatcher;
+        maxHeld = Math.max(maxHeld, d._inFlightCount + d._done.length);
+      }, 1);
+      var count = 0;
+      slow.on('finish', function () {
+        clearInterval(sampler);
+        assert.strictEqual(count, 60);
+        assert(maxHeld <= maxBlocks, 'held ' + maxHeld + ' exceeds ' + maxBlocks);
+        cb();
+      });
+      encoder.on('error', cb);
+      decoder.on('error', cb);
+      encoder.pipe(decoder).pipe(slow);
+      function write() {
+        while (count < 60) {
+          count++;
+          if (!encoder.write(count)) {
+            encoder.once('drain', write);
+            return;
+          }
+        }
+        encoder.end();
+      }
+      write();
+    });
+
+    test('bounds buffered bytes and still makes progress', function (cb) {
+      var t = Type.forSchema({type: 'fixed', name: 'Block', size: 100});
+      var maxBytes = 250;
+      var maxSeen = 0;
+      var codec = function (buf, done) {
+        setTimeout(function () { done(null, buf); }, 5);
+      };
+      var encoder = new streams.BlockEncoder(t, {
+        blockSize: 100,
+        codec: 'async',
+        codecs: {async: codec},
+        maxBlocks: 100,
+        maxBlockBytes: maxBytes
+      });
+      var decoder = new streams.BlockDecoder({codecs: {async: codec}});
+      var slow = new stream.Writable({
+        objectMode: true,
+        highWaterMark: 2,
+        write: function (chunk, enc, done) { setTimeout(done, 20); }
+      });
+      var sampler = setInterval(function () {
+        maxSeen = Math.max(maxSeen, encoder._dispatcher._bytes);
+      }, 1);
+      var count = 0;
+      slow.on('finish', function () {
+        clearInterval(sampler);
+        assert.strictEqual(count, 20);
+        // At most one oversized block can exceed the byte cap.
+        assert(maxSeen <= maxBytes + 100, 'held bytes ' + maxSeen);
+        cb();
+      });
+      encoder.on('error', cb);
+      decoder.on('error', cb);
+      encoder.pipe(decoder).pipe(slow);
+      var buf = utils.newBuffer(100);
+      function write() {
+        while (count < 20) {
+          count++;
+          if (!encoder.write(buf)) {
+            encoder.once('drain', write);
+            return;
+          }
+        }
+        encoder.end();
+      }
+      write();
+    });
+
+    test('ignores duplicate codec callbacks', function (cb) {
+      var t = Type.forSchema('int');
+      var blocks = 0;
+      var encoder = new streams.BlockEncoder(t, {
+        blockSize: 1,
+        codec: 'dup',
+        codecs: {
+          dup: function (buf, done) {
+            done(null, buf);
+            setTimeout(function () { done(new Error('duplicate error')); }, 5);
+            setTimeout(function () { done(null, buf); }, 10);
+          }
+        }
+      }).on('block', function () { blocks++; })
+        .on('error', cb);
+      var sink = new stream.Writable({write: function (c, e, done) { done(); }});
+      encoder.pipe(sink);
+      encoder.write(1);
+      encoder.write(2);
+      encoder.end(3);
+      sink.on('finish', function () {
+        assert.strictEqual(blocks, 3);
+        cb();
+      });
+    });
+
+    test('destroy ends operations once and stops publishing', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {
+        blockSize: 1,
+        codec: 'slow',
+        codecs: {slow: function (buf, done) {
+          setTimeout(function () { done(null, buf); }, 50);
+        }}
+      });
+      var pushed = 0;
+      encoder.on('data', function () { pushed++; });
+      encoder.on('error', function () {});
+      for (var i = 0; i < 5; i++) { encoder.write(i); }
+      setTimeout(function () {
+        encoder.destroy();
+        assert(encoder.destroyed);
+        // Late codec completions must not push any further data.
+        setTimeout(function () {
+          var dispatcher = encoder._dispatcher;
+          assert.strictEqual(dispatcher._inFlightCount, 0);
+          assert.strictEqual(dispatcher._done.length, 0);
+          cb();
+        }, 120);
+      }, 15);
+    });
+
+    test('synchronous codec keeps flowing without serialization', function (cb) {
+      var t = Type.forSchema('int');
+      var concurrent = 0;
+      var maxConcurrent = 0;
+      var syncCodec = function (buf, done) {
+        concurrent++;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        done(null, buf);
+        concurrent--;
+      };
+      var encoder = new streams.BlockEncoder(t, {
+        blockSize: 1,
+        codec: 'sync',
+        codecs: {sync: syncCodec}
+      });
+      var decoder = new streams.BlockDecoder({codecs: {sync: syncCodec}});
+      var vals = [];
+      decoder.on('data', function (v) { vals.push(v); })
+        .on('end', function () {
+          assert.deepEqual(vals, [1, 2, 3, 4, 5]);
+          assert(maxConcurrent >= 1);
+          cb();
+        });
+      encoder.on('error', cb);
+      decoder.on('error', cb);
+      encoder.pipe(decoder);
+      [1, 2, 3, 4, 5].forEach(function (n) { encoder.write(n); });
+      encoder.end();
+    });
+
   });
 
 });
