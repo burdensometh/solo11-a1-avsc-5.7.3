@@ -160,6 +160,7 @@ export class Type {
   clone(val: any, opts?: Partial<CloneOptions>): any;
   compare(val1: any, val2: any): number;
   compareBuffers(buf1: Buffer, buf2: Buffer): number;
+  createDefaultFactory(): () => any;
   createResolver(type: Type): Resolver;
   decode(buf: Buffer, pos?: number, resolver?: Resolver): { value: any, offset: number};
   encode(val: any, buf: Buffer, pos?: number): number;

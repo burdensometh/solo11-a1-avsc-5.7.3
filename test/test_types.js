@@ -4177,6 +4177,394 @@ suite('types', function () {
 
   });
 
+  suite('createDefaultFactory', function () {
+
+    test('record with defaults', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'Person',
+        fields: [
+          {name: 'name', type: 'string', default: 'ann'},
+          {name: 'age', type: 'int', default: 30},
+          {name: 'aliases', type: {type: 'array', items: 'string'},
+            default: ['a']},
+          {name: 'props', type: {type: 'map', values: 'int'},
+            default: {b: 2}},
+          {name: 'data', type: 'bytes', default: 'a1'},
+          {name: 'kind', type: {type: 'enum', name: 'K', symbols: ['X', 'Y']},
+            default: 'Y'},
+          {name: 'id', type: {type: 'fixed', name: 'I', size: 2},
+            default: 'zz'}
+        ]
+      });
+      var make = t.createDefaultFactory();
+      var v = make();
+      assert.strictEqual(v.name, 'ann');
+      assert.strictEqual(v.age, 30);
+      assert.deepEqual(v.aliases, ['a']);
+      assert.deepEqual(v.props, {b: 2});
+      assert.equal(v.data.toString('binary'), 'a1');
+      assert.strictEqual(v.kind, 'Y');
+      assert.equal(v.id.toString('binary'), 'zz');
+      assert(t.isValid(v));
+    });
+
+    test('constructible fields without defaults', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'arr', type: {type: 'array', items: 'int'}},
+          {name: 'map', type: {type: 'map', values: 'string'}},
+          {name: 'nil', type: 'null'},
+          {name: 'rec', type: {type: 'record', name: 'S', fields: [
+            {name: 'n', type: 'int', default: 3}
+          ]}},
+          {name: 'maybe', type: ['null', 'string']}
+        ]
+      });
+      var v = t.createDefaultFactory()();
+      assert.deepEqual(v.arr, []);
+      assert.deepEqual(v.map, {});
+      assert.strictEqual(v.nil, null);
+      assert.strictEqual(v.rec.n, 3);
+      assert.strictEqual(v.maybe, null);
+      assert(t.isValid(v));
+    });
+
+    test('union first branch record', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'u', type: [
+            {type: 'record', name: 'S', fields: [
+              {name: 'x', type: 'int', default: 2}
+            ]},
+            'null'
+          ]}
+        ]
+      });
+      var v = t.createDefaultFactory()();
+      assert.strictEqual(v.u.x, 2);
+      assert(t.isValid(v));
+    });
+
+    test('wrapped union first branch', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'u', type: [
+            {type: 'record', name: 'A', fields: [
+              {name: 'x', type: 'int', default: 7}
+            ]},
+            {type: 'record', name: 'B', fields: [
+              {name: 'y', type: 'string', default: 's'}
+            ]}
+          ]}
+        ]
+      });
+      var make = t.createDefaultFactory();
+      var v = make();
+      assert.strictEqual(v.u.A.x, 7);
+      assert(t.isValid(v));
+      // Wrapped values are also independent between calls.
+      assert(v.u !== make().u);
+    });
+
+    test('values are independent between calls', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'arr', type: {type: 'array', items: 'int'}, default: [1]},
+          {name: 'map', type: {type: 'map', values: 'int'}, default: {a: 1}},
+          {name: 'data', type: 'bytes', default: 'a1'},
+          {name: 'rec', type: {type: 'record', name: 'S', fields: [
+            {name: 'n', type: 'int', default: 3},
+            {name: 'tags', type: {type: 'array', items: 'string'}}
+          ]}}
+        ]
+      });
+      var make = t.createDefaultFactory();
+      var v1 = make();
+      var v2 = make();
+      assert(v1 !== v2);
+      assert(v1.arr !== v2.arr);
+      assert(v1.map !== v2.map);
+      assert(v1.data !== v2.data);
+      assert(v1.rec !== v2.rec);
+      assert(v1.rec.tags !== v2.rec.tags);
+      v1.arr.push(2);
+      v1.map.b = 2;
+      v1.data[0] = 98;
+      v1.rec.n = 9;
+      v1.rec.tags.push('x');
+      assert.deepEqual(v2.arr, [1]);
+      assert.deepEqual(v2.map, {a: 1});
+      assert.equal(v2.data.toString('binary'), 'a1');
+      assert.strictEqual(v2.rec.n, 3);
+      assert.deepEqual(v2.rec.tags, []);
+    });
+
+    test('missing defaults are aggregated', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'a', type: 'int'},
+          {name: 'b', type: {type: 'record', name: 'S', fields: [
+            {name: 'c', type: 'string'},
+            {name: 'd', type: 'int', default: 1}
+          ]}},
+          {name: 'e', type: {type: 'enum', name: 'E', symbols: ['X']}},
+          {name: 'f', type: {type: 'fixed', name: 'F', size: 1}},
+          {name: 'g', type: ['int', 'null']} // First branch has no default.
+        ]
+      });
+      assert.throws(function () { t.createDefaultFactory(); }, function (err) {
+        assert(/cannot create default factory/.test(err.message));
+        assert(/missing default at: a/.test(err.message));
+        assert(/missing default at: b\.c/.test(err.message));
+        assert(/missing default at: e/.test(err.message));
+        assert(/missing default at: f/.test(err.message));
+        assert(/missing default at: g/.test(err.message));
+        return true;
+      });
+    });
+
+    test('missing default at root', function () {
+      assert.throws(function () {
+        Type.forSchema('int').createDefaultFactory();
+      }, /missing default at: <root>/);
+    });
+
+    test('unbounded recursion is rejected', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'Node',
+        fields: [{name: 'next', type: 'Node'}]
+      });
+      assert.throws(function () { t.createDefaultFactory(); }, function (err) {
+        assert(/recursive type Node/.test(err.message));
+        assert(/cycle: Node -> next -> Node/.test(err.message));
+        return true;
+      });
+    });
+
+    test('unbounded indirect recursion is rejected', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'A',
+        fields: [
+          {name: 'b', type: {type: 'record', name: 'B', fields: [
+            {name: 'a', type: 'A'}
+          ]}}
+        ]
+      });
+      assert.throws(function () { t.createDefaultFactory(); }, function (err) {
+        assert(/cycle: A -> b -> a -> A/.test(err.message));
+        return true;
+      });
+    });
+
+    test('unbounded recursion through union first branch', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'Node',
+        fields: [{name: 'next', type: ['Node', 'null']}]
+      });
+      assert.throws(function () { t.createDefaultFactory(); }, /cycle/);
+    });
+
+    test('bounded recursion is supported', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'Node',
+        fields: [
+          {name: 'v', type: 'int', default: 5},
+          {name: 'next', type: ['null', 'Node']},
+          {name: 'children', type: {type: 'array', items: 'Node'}},
+          {name: 'refs', type: {type: 'map', values: 'Node'}}
+        ]
+      });
+      var v = t.createDefaultFactory()();
+      assert.strictEqual(v.v, 5);
+      assert.strictEqual(v.next, null);
+      assert.deepEqual(v.children, []);
+      assert.deepEqual(v.refs, {});
+      assert(t.isValid(v));
+    });
+
+    test('shared named types are supported', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'D',
+        fields: [
+          {name: 'l', type: {type: 'record', name: 'C', fields: [
+            {name: 'n', type: 'int', default: 1}
+          ]}},
+          {name: 'r', type: 'C'}
+        ]
+      });
+      var make = t.createDefaultFactory();
+      var v = make();
+      assert.strictEqual(v.l.n, 1);
+      assert.strictEqual(v.r.n, 1);
+      assert(v.l !== v.r);
+      assert(t.isValid(v));
+    });
+
+    test('logical type with default', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'at', type: {type: 'long', logicalType: 'date'}, default: 123}
+        ]
+      }, {logicalTypes: {date: DateType}});
+      var v = t.createDefaultFactory()();
+      assert(v.at instanceof Date);
+      assert.strictEqual(+v.at, 123);
+      assert(t.isValid(v));
+    });
+
+    test('logical type without default', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'l', type: {type: 'array', items: 'int', logicalType: 'list'}}
+        ]
+      }, {logicalTypes: {list: ListType}});
+      var make = t.createDefaultFactory();
+      var v1 = make();
+      var v2 = make();
+      assert.deepEqual(v1.l, {items: []});
+      assert(t.isValid(v1));
+      assert(v1.l !== v2.l);
+      assert(v1.l.items !== v2.l.items);
+    });
+
+    test('invalid logical type default', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'b', type: {type: 'map', values: 'int', logicalType: 'bad'}}
+        ]
+      }, {logicalTypes: {bad: BadType}});
+      assert.throws(function () { t.createDefaultFactory(); }, function (err) {
+        assert(/cannot construct valid default for logical:bad at: b/
+          .test(err.message));
+        return true;
+      });
+    });
+
+    test('logical type over primitive without default', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 'at', type: {type: 'long', logicalType: 'date'}}
+        ]
+      }, {logicalTypes: {date: DateType}});
+      assert.throws(function () { t.createDefaultFactory(); },
+        /missing default at: at/);
+    });
+
+    test('non-record root types', function () {
+      var makeArr = Type.forSchema({type: 'array', items: 'int'})
+        .createDefaultFactory();
+      assert.deepEqual(makeArr(), []);
+      assert(makeArr() !== makeArr());
+      assert.strictEqual(Type.forSchema('null').createDefaultFactory()(), null);
+      var v = Type.forSchema(['null', 'int']).createDefaultFactory()();
+      assert.strictEqual(v, null);
+    });
+
+    test('default values roundtrip', function () {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [
+          {name: 's', type: 'string', default: 'hi'},
+          {name: 'arr', type: {type: 'array', items: 'int'}},
+          {name: 'rec', type: {type: 'record', name: 'S', fields: [
+            {name: 'b', type: 'bytes', default: 'xy'}
+          ]}}
+        ]
+      });
+      var v = t.createDefaultFactory()();
+      assert.deepEqual(t.fromBuffer(t.toBuffer(v)), v);
+    });
+
+    test('error type', function () {
+      var t = Type.forSchema({
+        type: 'error',
+        name: 'E',
+        fields: [{name: 'msg', type: 'string', default: 'boom'}]
+      });
+      var v = t.createDefaultFactory()();
+      assert(v instanceof Error);
+      assert.strictEqual(v.msg, 'boom');
+      assert(t.isValid(v));
+    });
+
+    function DateType(schema, opts) {
+      LogicalType.call(this, schema, opts);
+    }
+    util.inherits(DateType, LogicalType);
+
+    DateType.prototype._fromValue = function (val) { return new Date(val); };
+
+    DateType.prototype._toValue = function (date) {
+      if (!(date instanceof Date)) {
+        return undefined;
+      }
+      return +date;
+    };
+
+    DateType.prototype._resolve = function (type) {
+      if (Type.isType(type, 'long')) {
+        return this._fromValue;
+      }
+    };
+
+    function ListType(schema, opts) {
+      LogicalType.call(this, schema, opts);
+    }
+    util.inherits(ListType, LogicalType);
+
+    ListType.prototype._fromValue = function (arr) {
+      return {items: arr};
+    };
+
+    ListType.prototype._toValue = function (obj) {
+      if (!obj || !Array.isArray(obj.items)) {
+        return undefined;
+      }
+      return obj.items;
+    };
+
+    ListType.prototype._resolve = function () {};
+
+    function BadType(schema, opts) {
+      LogicalType.call(this, schema, opts);
+    }
+    util.inherits(BadType, LogicalType);
+
+    BadType.prototype._fromValue = function () {
+      throw new Error('cannot convert');
+    };
+
+    BadType.prototype._toValue = function () { return {}; };
+
+    BadType.prototype._resolve = function () {};
+
+  });
+
 });
 
 function testType(Type, data, invalidSchemas) {
