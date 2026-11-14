@@ -63,6 +63,8 @@ declare namespace schema {
   }
   interface LogicalTypeExtension {
     logicalType: string;
+    precision?: number;
+    scale?: number;
     [param: string]: any;
   }
 }
@@ -313,6 +315,15 @@ export namespace types {
   class BooleanType extends Type {  // TODO: Document this on the wiki
     constructor();
     random(): BooleanType;
+  }
+
+  class DecimalType extends LogicalType {
+    constructor(schema: Schema, opts?: any);
+    readonly precision: number;
+    readonly scale: number;
+    getPrecision(): number;
+    getScale(): number;
+    random(): DecimalType;
   }
 
   class BytesType extends Type {  // TODO: Document this on the wiki
