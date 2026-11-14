@@ -486,6 +486,184 @@ suite('containers', function () {
         ).toBuffer());
       });
 
+      test('truncated header', function (cb) {
+        var decoder = new BlockDecoder()
+          .on('data', function () {})
+          .on('error', function (err) {
+            assert(/truncated header/.test(err.message));
+            cb();
+          });
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        decoder.end(header.slice(0, header.length - 1));
+      });
+
+      test('truncated block prefix', function (cb) {
+        var decoder = new BlockDecoder()
+          .on('data', function () {})
+          .on('error', function (err) {
+            assert(/truncated block/.test(err.message));
+            cb();
+          });
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        decoder.write(header);
+        decoder.end(utils.bufferFrom([2, 2])); // Count and length, no payload.
+      });
+
+      test('truncated block payload', function (cb) {
+        var decoder = new BlockDecoder()
+          .on('data', function () {})
+          .on('error', function (err) {
+            assert(/truncated block/.test(err.message));
+            cb();
+          });
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        decoder.write(header);
+        decoder.write(utils.bufferFrom([2, 4])); // Count and length.
+        decoder.end(utils.bufferFrom([96])); // Only one of two payload bytes.
+      });
+
+      test('truncated sync marker', function (cb) {
+        var decoder = new BlockDecoder()
+          .on('data', function () {})
+          .on('error', function (err) {
+            assert(/truncated block/.test(err.message));
+            cb();
+          });
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        var block = new Block(1, Type.forSchema('int').toBuffer(1), SYNC).toBuffer();
+        decoder.write(header);
+        decoder.end(block.slice(0, block.length - 1));
+      });
+
+      test('block declares too many records', function (cb) {
+        var decoder = new BlockDecoder()
+          .on('data', function () {})
+          .on('error', function (err) {
+            assert(/truncated block/.test(err.message));
+            cb();
+          });
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        decoder.write(header);
+        decoder.end(new Block(3, Type.forSchema('int').toBuffer(1), SYNC).toBuffer());
+      });
+
+      test('block declares too few records', function (cb) {
+        var decoder = new BlockDecoder()
+          .on('data', function () {})
+          .on('error', function (err) {
+            assert(/count mismatch/.test(err.message));
+            cb();
+          });
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        var type = Type.forSchema('int');
+        var data = Buffer.concat([type.toBuffer(1), type.toBuffer(2)]);
+        decoder.write(header);
+        decoder.end(new Block(1, data, SYNC).toBuffer());
+      });
+
+      test('trailing data after complete block', function (cb) {
+        var decoder = new BlockDecoder()
+          .on('data', function () {})
+          .on('error', function (err) {
+            assert(/truncated block/.test(err.message));
+            cb();
+          });
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        decoder.write(header);
+        decoder.write(new Block(
+          1, Type.forSchema('int').toBuffer(1), SYNC
+        ).toBuffer());
+        decoder.end(utils.bufferFrom([127])); // Incomplete trailing block.
+      });
+
+      test('empty file ends cleanly', function (cb) {
+        var decoder = new BlockDecoder()
+          .on('data', function () { throw new Error('unexpected data'); })
+          .on('error', function (err) { throw err; })
+          .on('end', cb);
+        decoder.end();
+      });
+
+      test('error and end only notified once', function (cb) {
+        var nErrors = 0;
+        var nEnds = 0;
+        var decoder = new BlockDecoder()
+          .on('data', function () {})
+          .on('error', function () { nErrors++; })
+          .on('end', function () {
+            nEnds++;
+            assert.strictEqual(nErrors, 1);
+            assert.strictEqual(nEnds, 1);
+            cb();
+          });
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        decoder.write(header);
+        decoder.end(utils.bufferFrom([2, 2]));
+      });
+
+      test('consistent regardless of chunk boundaries', function (cb) {
+        var type = Type.forSchema('int');
+        var header = new Header(
+          MAGIC_BYTES,
+          {'avro.schema': utils.bufferFrom('"int"')},
+          SYNC
+        ).toBuffer();
+        var buf = Buffer.concat([
+          header,
+          new Block(2, Buffer.concat([type.toBuffer(1), type.toBuffer(2)]), SYNC).toBuffer(),
+          new Block(1, type.toBuffer(3), SYNC).toBuffer()
+        ]);
+        var pending = buf.length + 1;
+        for (var i = 0; i <= buf.length; i++) {
+          (function (split) {
+            var vals = [];
+            var decoder = new BlockDecoder()
+              .on('data', function (val) { vals.push(val); })
+              .on('error', function (err) { throw err; })
+              .on('end', function () {
+                assert.deepEqual(vals, [1, 2, 3]);
+                if (!--pending) {
+                  cb();
+                }
+              });
+            decoder.write(buf.slice(0, split));
+            decoder.end(buf.slice(split));
+          })(i);
+        }
+      });
+
     });
 
   });
