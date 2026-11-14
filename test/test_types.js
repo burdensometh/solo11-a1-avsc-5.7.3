@@ -1894,6 +1894,156 @@ suite('types', function () {
       assert.throws(function () { v2.createResolver(v1); });
     });
 
+    test('failed resolution does not leave stale resolvers', function () {
+      var v1 = Type.forSchema({
+        type: 'record',
+        name: 'Person',
+        fields: [{name: 'friends', type: {type: 'array', items: 'Person'}}]
+      });
+      var v2 = Type.forSchema({
+        type: 'record',
+        name: 'Person',
+        fields: [
+          {name: 'friends', type: {type: 'array', items: 'Person'}},
+          {name: 'age', type: 'int'}
+        ]
+      });
+      var opts = {};
+      // This fails because the reader requires `age`, absent from the writer.
+      assert.throws(function () { v2.createResolver(v1, opts); });
+      // The partially built resolver must not have been published.
+      assert.deepEqual(Object.keys(opts.registry), []);
+      // A subsequent compatible resolution must succeed and decode correctly.
+      var v3 = Type.forSchema({
+        type: 'record',
+        name: 'Person',
+        fields: [
+          {name: 'friends', type: {type: 'array', items: 'Person'}},
+          {name: 'age', type: 'int'}
+        ]
+      });
+      var resolver = v2.createResolver(v3, opts);
+      var p1 = {friends: [{friends: [], age: 1}], age: 10};
+      var p2 = v2.fromBuffer(v3.toBuffer(p1), resolver);
+      assert.deepEqual(p2, {friends: [{friends: [], age: 1}], age: 10});
+    });
+
+    test('failed resolution preserves existing resolvers', function () {
+      var goodWriter = Type.forSchema({
+        type: 'record',
+        name: 'Person',
+        fields: [{name: 'friends', type: {type: 'array', items: 'Person'}}]
+      });
+      var reader = Type.forSchema({
+        type: 'record',
+        name: 'Person',
+        fields: [{name: 'friends', type: {type: 'array', items: 'Person'}}]
+      });
+      var opts = {};
+      var resolver = reader.createResolver(goodWriter, opts);
+      var keys = Object.keys(opts.registry);
+      assert.equal(keys.length, 1);
+      assert.strictEqual(opts.registry[keys[0]], resolver);
+      // A failing resolution against the same registry must not alter it.
+      var badWriter = Type.forSchema({
+        type: 'record',
+        name: 'Person',
+        fields: []
+      });
+      assert.throws(function () { reader.createResolver(badWriter, opts); });
+      assert.deepEqual(Object.keys(opts.registry), keys);
+      assert.strictEqual(opts.registry[keys[0]], resolver);
+      // The original resolver still works.
+      var p1 = {friends: [{friends: []}]};
+      assert.deepEqual(
+        reader.fromBuffer(goodWriter.toBuffer(p1), opts.registry[keys[0]]),
+        p1
+      );
+    });
+
+    test('resolvers are not shared between same-named types', function () {
+      // Both records are named `Foo` but have different fields. Caching by
+      // name only would incorrectly reuse the first resolver for the second
+      // (incompatible) writer type.
+      var reader = Type.forSchema({
+        type: 'record',
+        name: 'Foo',
+        fields: [
+          {name: 'a', type: 'int'},
+          {name: 'b', type: 'string'}
+        ]
+      });
+      var writer1 = Type.forSchema({
+        type: 'record',
+        name: 'Foo',
+        fields: [
+          {name: 'a', type: 'int'},
+          {name: 'b', type: 'string'}
+        ]
+      });
+      var writer2 = Type.forSchema({
+        type: 'record',
+        name: 'Foo',
+        fields: [{name: 'a', type: 'int'}]
+      });
+      var opts = {};
+      var resolver1 = reader.createResolver(writer1, opts);
+      var val1 = {a: 1, b: 'hi'};
+      assert.deepEqual(
+        reader.fromBuffer(writer1.toBuffer(val1), resolver1),
+        val1
+      );
+      // The second writer is missing `b` (no default), so this must throw
+      // rather than return the cached resolver for `writer1`.
+      assert.throws(function () {
+        reader.createResolver(writer2, opts);
+      }, /no matching field for default-less Foo.b/);
+    });
+
+    test('resolvers are reused for identical type pairs', function () {
+      var reader = Type.forSchema({
+        type: 'record',
+        name: 'Foo',
+        fields: [{name: 'friends', type: {type: 'array', items: 'Foo'}}]
+      });
+      var writer = Type.forSchema({
+        type: 'record',
+        name: 'Foo',
+        fields: [{name: 'friends', type: {type: 'array', items: 'Foo'}}]
+      });
+      var opts = {};
+      var resolver1 = reader.createResolver(writer, opts);
+      var resolver2 = reader.createResolver(writer, opts);
+      assert.strictEqual(resolver1, resolver2);
+      // Only the top-level resolver is published; recursive references point
+      // at the same instance rather than being registered separately.
+      assert.equal(Object.keys(opts.registry).length, 1);
+      var val = {friends: [{friends: []}]};
+      assert.deepEqual(reader.fromBuffer(writer.toBuffer(val), resolver2), val);
+    });
+
+    test('failed union branch does not leave stale resolvers', function () {
+      var reader = Type.forSchema([
+        'null',
+        {
+          type: 'record',
+          name: 'Inner',
+          fields: [{name: 'a', type: 'int'}]
+        }
+      ]);
+      var writer = Type.forSchema([
+        'null',
+        {
+          type: 'record',
+          name: 'Inner',
+          fields: [{name: 'b', type: 'string'}]
+        }
+      ]);
+      var opts = {};
+      assert.throws(function () { reader.createResolver(writer, opts); });
+      assert.deepEqual(Object.keys(opts.registry), []);
+    });
+
     test('resolve consolidated reads same type', function () {
       var t1 = Type.forSchema({
         type: 'record',
