@@ -3188,6 +3188,356 @@ suite('types', function () {
 
   });
 
+  suite('DecimalType', function () {
+
+    test('enabled by default', function () {
+      var t = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 4,
+        scale: 2
+      });
+      assert(t instanceof builtins.DecimalType);
+      assert.equal(t.typeName, 'logical:decimal');
+      assert.equal(t.precision, 4);
+      assert.equal(t.scale, 2);
+      assert(t.getUnderlyingType() instanceof builtins.BytesType);
+    });
+
+    test('default scale', function () {
+      var t = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 4
+      });
+      assert.equal(t.scale, 0);
+      assert.equal(t.fromBuffer(t.toBuffer('1234')), '1234');
+    });
+
+    test('bytes encoding', function () {
+      var t = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 6,
+        scale: 2
+      });
+      var cases = {
+        '0.00': '00',
+        '1.23': '7b',
+        '-1.23': '85',
+        '123.45': '3039',
+        '-123.45': 'cfc7',
+        '128.00': '3200',
+        '-128.00': 'ce00'
+      };
+      Object.keys(cases).forEach(function (str) {
+        var buf = t.toBuffer(str);
+        assert.equal(buf.slice(1).toString('hex'), cases[str]); // Skip length.
+        assert.equal(t.fromBuffer(buf), str);
+      });
+    });
+
+    test('fixed encoding', function () {
+      var t = Type.forSchema({
+        type: 'fixed',
+        name: 'Dec',
+        size: 4,
+        logicalType: 'decimal',
+        precision: 8,
+        scale: 2
+      });
+      assert(t.getUnderlyingType() instanceof builtins.FixedType);
+      var cases = {
+        '12.34': '000004d2',
+        '-12.34': 'fffffb2e',
+        '0.00': '00000000'
+      };
+      Object.keys(cases).forEach(function (str) {
+        assert.equal(t.toBuffer(str).toString('hex'), cases[str]);
+        assert.equal(t.fromBuffer(t.toBuffer(str)), str);
+      });
+    });
+
+    test('large values without floating point', function () {
+      var t = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 50,
+        scale: 0
+      });
+      var val = '12345678901234567890123456789012345678901234567890';
+      assert.equal(t.fromBuffer(t.toBuffer(val)), val);
+      assert.equal(t.fromBuffer(t.toBuffer('-' + val)), '-' + val);
+    });
+
+    test('validation', function () {
+      var t = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 4,
+        scale: 2
+      });
+      assert(t.isValid('12.34'));
+      assert(t.isValid('0'));
+      assert(t.isValid(12)); // Exact integers accepted.
+      assert(!t.isValid('123.45')); // Too precise.
+      assert(!t.isValid('1.234')); // Cannot scale exactly.
+      assert(!t.isValid('abc'));
+      assert(!t.isValid(null));
+      assert(!t.isValid(1.234));
+      assert.throws(function () { t.toBuffer('123.45'); });
+      assert.throws(function () { t.toBuffer('1.234'); });
+    });
+
+    test('fixed size validation', function () {
+      assert.throws(function () {
+        Type.forSchema({
+          type: 'fixed',
+          name: 'Small',
+          size: 4,
+          logicalType: 'decimal',
+          precision: 10
+        }, {assertLogicalTypes: true});
+      });
+      // Without the assert option, the invalid logical type falls back.
+      assert(Type.forSchema({
+        type: 'fixed',
+        name: 'SmallFallback',
+        size: 4,
+        logicalType: 'decimal',
+        precision: 10
+      }) instanceof builtins.FixedType);
+      var t = Type.forSchema({
+        type: 'fixed',
+        name: 'Ok',
+        size: 5,
+        logicalType: 'decimal',
+        precision: 10,
+        scale: 2
+      });
+      assert(t.isValid('12345678.90'));
+    });
+
+    test('invalid schema falls back to underlying type', function () {
+      var t = Type.forSchema({
+        type: 'string',
+        logicalType: 'decimal',
+        precision: 4
+      });
+      assert(t instanceof builtins.StringType);
+      assert.throws(function () {
+        Type.forSchema({
+          type: 'string',
+          logicalType: 'decimal',
+          precision: 4
+        }, {assertLogicalTypes: true});
+      });
+      // Unknown logical types are unaffected.
+      var u = Type.forSchema({type: 'bytes', logicalType: 'custom'});
+      assert(u instanceof builtins.BytesType);
+    });
+
+    test('clone and random', function () {
+      var t = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 8,
+        scale: 3
+      });
+      assert.equal(t.clone('12.345'), '12.345');
+      assert.throws(function () { t.clone('nope'); });
+      var val = t.random();
+      assert(t.isValid(val));
+      assert.equal(t.fromBuffer(t.toBuffer(val)), val);
+    });
+
+    test('compare', function () {
+      var t = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 8,
+        scale: 2
+      });
+      assert.equal(t.compare('1.00', '2.00'), -1);
+      assert.equal(t.compare('2.00', '1.00'), 1);
+      assert.equal(t.compare('-1.00', '1.00'), -1);
+      assert.equal(t.compare('1.00', '1'), 0);
+      assert.equal(t.compare('0', '-0'), 0);
+    });
+
+    test('schema export', function () {
+      var t = Type.forSchema({
+        type: 'fixed',
+        name: 'Dec',
+        size: 4,
+        logicalType: 'decimal',
+        precision: 8,
+        scale: 2
+      });
+      assert.deepEqual(t.getSchema(), {
+        name: 'Dec',
+        type: 'fixed',
+        size: 4
+      });
+      assert.deepEqual(t.getSchema({exportAttrs: true}), {
+        type: 'fixed',
+        name: 'Dec',
+        size: 4,
+        logicalType: 'decimal',
+        precision: 8,
+        scale: 2
+      });
+      var b = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 8
+      });
+      assert.equal(b.getSchema(), 'bytes');
+      assert.deepEqual(b.getSchema({exportAttrs: true}), {
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 8
+      });
+    });
+
+    test('resolve decimal to decimal', function () {
+      var w = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 6,
+        scale: 2
+      });
+      var rUp = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 8,
+        scale: 3
+      });
+      assert.equal(
+        rUp.fromBuffer(w.toBuffer('12.34'), rUp.createResolver(w)),
+        '12.340'
+      );
+      var rDown = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 8,
+        scale: 1
+      });
+      assert.equal(
+        rDown.fromBuffer(w.toBuffer('12.30'), rDown.createResolver(w)),
+        '12.3'
+      );
+      assert.throws(function () {
+        rDown.fromBuffer(w.toBuffer('12.34'), rDown.createResolver(w));
+      });
+    });
+
+    test('resolve preserves precision across scales', function () {
+      // Padding zeroes added when increasing scale must not count against the
+      // reader's precision, and the raw value is decoded (not re-parsed).
+      var w = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 4,
+        scale: 2
+      });
+      var r = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 4,
+        scale: 4
+      });
+      assert.equal(
+        r.fromBuffer(w.toBuffer('99.99'), r.createResolver(w)),
+        '99.9900'
+      );
+      assert.equal(
+        r.fromBuffer(w.toBuffer('-0.01'), r.createResolver(w)),
+        '-0.0100'
+      );
+      assert.equal(
+        r.fromBuffer(w.toBuffer('0'), r.createResolver(w)),
+        '0.0000'
+      );
+      var small = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 3,
+        scale: 2
+      });
+      assert.throws(function () {
+        small.fromBuffer(w.toBuffer('99.99'), small.createResolver(w));
+      });
+    });
+
+    test('resolve against underlying types', function () {
+      var decimal = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 6,
+        scale: 2
+      });
+      var bytes = Type.forSchema('bytes');
+      var buf = Buffer.from('04d2', 'hex'); // 1234 -> 12.34.
+      assert.equal(
+        decimal.fromBuffer(bytes.toBuffer(buf), decimal.createResolver(bytes)),
+        '12.34'
+      );
+      assert.deepEqual(
+        bytes.fromBuffer(decimal.toBuffer('12.34'), bytes.createResolver(decimal)),
+        buf
+      );
+
+      var wf = Type.forSchema({
+        type: 'fixed',
+        name: 'D',
+        size: 3,
+        logicalType: 'decimal',
+        precision: 6,
+        scale: 2
+      });
+      var rf = Type.forSchema({
+        type: 'fixed',
+        name: 'D',
+        size: 3,
+        logicalType: 'decimal',
+        precision: 6,
+        scale: 2
+      });
+      assert.equal(
+        rf.fromBuffer(wf.toBuffer('-1.01'), rf.createResolver(wf)),
+        '-1.01'
+      );
+      assert.throws(function () {
+        rf.createResolver(Type.forSchema({
+          type: 'fixed',
+          name: 'D',
+          size: 4,
+          logicalType: 'decimal',
+          precision: 6,
+          scale: 2
+        }));
+      });
+    });
+
+    test('user logical type override', function () {
+      function Passthrough(schema, opts) {
+        LogicalType.call(this, schema, opts);
+      }
+      util.inherits(Passthrough, LogicalType);
+      Passthrough.prototype._fromValue = function (buf) { return buf; };
+      Passthrough.prototype._toValue = function (buf) { return buf; };
+      var t = Type.forSchema({
+        type: 'bytes',
+        logicalType: 'decimal',
+        precision: 4
+      }, {logicalTypes: {decimal: Passthrough}});
+      assert(!(t instanceof builtins.DecimalType));
+      assert(t instanceof Passthrough);
+    });
+
+  });
+
   suite('Type.forSchema', function  () {
 
     test('null type', function () {
