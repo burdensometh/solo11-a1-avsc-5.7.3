@@ -91,6 +91,31 @@ const avro = require('avsc');
     .on('data', function (val) { /* Do something with the decoded value. */ });
   ```
 
++ Interrupt and resume a container file at any record, without replaying the
+  whole file:
+
+  ```javascript
+  const decoder = avro.createFileDecoder('./values.avro');
+
+  let position = null;
+  decoder.on('data', (val) => {
+    // `position` only advances once a record has been handed to the consumer,
+    // so it is safe to save it even with backpressure or asynchronous codecs.
+    position = decoder.getPosition();
+    if (shouldStop(val)) {
+      decoder.destroy();
+      // Persist `JSON.stringify(position)` anywhere, then later:
+      avro.createFileDecoder('./values.avro', {position})
+        .on('data', (next) => { /* Skip nothing: pick up after the last one. */ });
+    }
+  });
+  ```
+
+  Positions are bound to the file's header and writer schema, and include the
+  block's byte offset and sync marker. Resuming from a position which doesn't
+  match the file (different schema, codec, sync marker, or block) is rejected
+  with an error.
+
 + Implement a TCP server for an [IDL-defined][idl] protocol:
 
   ```javascript

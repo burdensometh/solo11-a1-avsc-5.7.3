@@ -84,7 +84,32 @@ interface DecoderOptions {
   noDecode: boolean;
   readerSchema: string | object | Type;
   codecs: CodecOptions;
-  parseHook: (schema: Schema) => Type
+  parseHook: (schema: Schema) => Type;
+  position?: Position | string | null;
+  checkpoint?: Position | string | null;
+  resume?: Position | string | null;
+}
+
+/**
+ * Record-level position within an Avro container file.
+ *
+ * Instances are immutable. They can be serialized to JSON (or with
+ * `JSON.stringify`/`toString`) and stored, then passed back to a
+ * `BlockDecoder` via the `position` option to resume reading after this
+ * record. The position is bound to the file's header (`fileId`) and writer
+ * schema (`schema`), so resuming from a different file is rejected.
+ */
+interface Position {
+  readonly fileId: string;
+  readonly schema: string;
+  readonly block: number;
+  readonly index: number;
+  readonly record: number;
+  readonly offset?: number;
+  readonly sync?: string;
+  readonly compressed?: number;
+  readonly checksum?: string;
+  toJSON(): object;
 }
 
 interface EncoderOptions {
@@ -283,6 +308,18 @@ export namespace streams {
   class BlockDecoder extends stream.Duplex {
     constructor(opts?: Partial<DecoderOptions>);
     static defaultCodecs(): CodecOptions;
+
+    /**
+     * Position of the last record handed over to the consumer.
+     *
+     * This never advances ahead of consumption: it is unaffected by readable
+     * stream buffering, backpressure, or pending asynchronous decompression.
+     * Returns `null` if no record has been consumed yet.
+     */
+    getPosition(): Position | null;
+    getCheckpoint(): Position | null;
+    readonly position: Position | null;
+    readonly checkpoint: Position | null;
 
     //should add meta-data listener, but regrettably that requires all other events to be repeated
     //here, or else they won't show up in code-completion. To avoid clutter, the meta-data event

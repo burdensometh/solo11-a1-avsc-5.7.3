@@ -791,6 +791,351 @@ suite('containers', function () {
       decoder.end();
     });
 
+    test('position not advanced while paused', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {blockSize: 8});
+      var decoder = new streams.BlockDecoder();
+      var vals = [];
+      var pausedAt;
+      encoder.pipe(decoder);
+      decoder.on('data', function (val) {
+        vals.push(val);
+        if (vals.length === 5) {
+          decoder.pause();
+          pausedAt = decoder.getPosition();
+          assert.equal(pausedAt.record, 4);
+          setImmediate(function () {
+            // Decompression may have completed in the background, but no new
+            // record was consumed so the position must be unchanged.
+            assert.strictEqual(decoder.getPosition(), pausedAt);
+            decoder.resume();
+          });
+        }
+      });
+      decoder.on('end', function () {
+        assert.deepEqual(vals, [1, 2, 3, 4, 5, 6]);
+        assert.equal(decoder.getPosition().record, 5);
+        cb();
+      });
+      encoder.write(1);
+      encoder.write(2);
+      encoder.write(3);
+      encoder.write(4);
+      encoder.write(5);
+      encoder.end(6);
+    });
+
+    test('position after asynchronous decompression', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {blockSize: 8});
+      var decoder = new streams.BlockDecoder({
+        codecs: {
+          'null': function (buf, cb) {
+            setTimeout(function () { cb(null, buf); }, 10);
+          }
+        }
+      });
+      var vals = [];
+      var positions = [];
+      encoder.pipe(decoder);
+      decoder.on('data', function (val) {
+        vals.push(val);
+        positions.push(decoder.getPosition().record);
+      });
+      decoder.on('end', function () {
+        assert.deepEqual(vals, [1, 2, 3, 4]);
+        assert.deepEqual(positions, vals.map(function (v, i) { return i; }));
+        cb();
+      });
+      encoder.write(1);
+      encoder.write(2);
+      encoder.write(3);
+      encoder.end(4);
+    });
+
+    test('position serialization', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {blockSize: 4});
+      var decoder = new streams.BlockDecoder();
+      encoder.pipe(decoder);
+      decoder.on('data', function () {
+        if (decoder.getPosition().record !== 2) {
+          return;
+        }
+        var pos = decoder.getPosition();
+        assert(Object.isFrozen(pos));
+        assert.deepEqual(JSON.parse(pos.toString()), pos.toJSON());
+        assert.deepEqual(JSON.parse(JSON.stringify(pos)), pos.toJSON());
+        cb();
+      });
+      encoder.write(1);
+      encoder.write(2);
+      encoder.end(3);
+    });
+
+    test('resume', function (cb) {
+      var t = Type.forSchema({
+        type: 'record',
+        name: 'Person',
+        fields: [
+          {name: 'name', type: 'string'},
+          {name: 'age', type: 'int'}
+        ]
+      });
+      var people = [];
+      var i;
+      for (i = 0; i < 10; i++) {
+        people.push({name: 'p' + i, age: i});
+      }
+      var bufs = [];
+      var encoder = new streams.BlockEncoder(t, {blockSize: 16});
+      encoder.on('data', function (buf) { bufs.push(buf); });
+      encoder.on('end', function () {
+        var buf = Buffer.concat(bufs);
+        var decoder = new streams.BlockDecoder();
+        var position;
+        decoder.on('data', function (val) {
+          if (val.age === 3) {
+            position = decoder.getPosition();
+            assert.equal(position.record, 3);
+            decodeRest();
+          }
+        });
+        decoder.on('error', function () {});
+        decoder.end(buf);
+
+        function decodeRest() {
+          var resumedVals = [];
+          var resumed = new streams.BlockDecoder({position: position})
+            .on('data', function (val) { resumedVals.push(val); })
+            .on('end', function () {
+              assert.deepEqual(resumedVals, people.slice(4));
+              cb();
+            });
+          // Split the input to exercise partial blocks.
+          resumed.write(buf.slice(0, 23));
+          resumed.end(buf.slice(23));
+        }
+      });
+      people.forEach(function (person) { encoder.write(person); });
+      encoder.end();
+    });
+
+    test('resume with string position', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {blockSize: 4, writeHeader: true});
+      var bufs = [];
+      var vals = [];
+      var position;
+      encoder.on('data', function (buf) { bufs.push(buf); });
+      encoder.on('end', function () {
+        var buf = Buffer.concat(bufs);
+        var decoder = new streams.BlockDecoder();
+        decoder.on('data', function (val) {
+          vals.push(val);
+          if (vals.length === 2) {
+            position = decoder.getPosition().toString();
+          }
+        });
+        decoder.on('end', function () {
+          var resumedVals = [];
+          new streams.BlockDecoder({position: position})
+            .on('data', function (val) { resumedVals.push(val); })
+            .on('end', function () {
+              assert.deepEqual(resumedVals, [3, 4, 5]);
+              cb();
+            })
+            .end(buf);
+        });
+        decoder.end(buf);
+      });
+      encoder.write(1);
+      encoder.write(2);
+      encoder.write(3);
+      encoder.write(4);
+      encoder.end(5);
+    });
+
+    test('resume file mismatch', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {writeHeader: true});
+      var bufs = [];
+      encoder.on('data', function (buf) { bufs.push(buf); });
+      encoder.on('end', function () {
+        var buf = Buffer.concat(bufs);
+        var decoder = new streams.BlockDecoder();
+        decoder.once('data', function () {
+          var position = JSON.parse(JSON.stringify(decoder.getPosition()));
+          position.fileId = Array(33).join('0');
+          var other = new streams.BlockDecoder({position: position});
+          other.on('data', function () {});
+          other.on('error', function (err) {
+            assert(/file mismatch/.test(err.message));
+            cb();
+          });
+          other.end(buf);
+        });
+        decoder.on('data', function () {});
+        decoder.end(buf);
+      });
+      encoder.end(1);
+    });
+
+    test('resume schema mismatch', function (cb) {
+      var t1 = Type.forSchema('int');
+      var t2 = Type.forSchema('long');
+      var encoder = new streams.BlockEncoder(t1, {writeHeader: true});
+      var bufs = [];
+      encoder.on('data', function (buf) { bufs.push(buf); });
+      encoder.on('end', function () {
+        var buf = Buffer.concat(bufs);
+        var decoder = new streams.BlockDecoder();
+        decoder.once('data', function () {
+          var position = JSON.parse(JSON.stringify(decoder.getPosition()));
+          position.schema = t2.fingerprint().toString('hex');
+          decoder.destroy();
+          var other = new streams.BlockDecoder({position: position});
+          other.on('error', function (err) {
+            assert(/schema mismatch/.test(err.message));
+            cb();
+          });
+          other.end(buf);
+        });
+        decoder.end(buf);
+      });
+      encoder.end(1);
+    });
+
+    test('resume offset mismatch', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {blockSize: 4});
+      var bufs = [];
+      encoder.on('data', function (buf) { bufs.push(buf); });
+      encoder.on('end', function () {
+        var buf = Buffer.concat(bufs);
+        var decoder = new streams.BlockDecoder();
+        var vals = [];
+        decoder.on('data', function (val) {
+          vals.push(val);
+          if (vals.length === 2) {
+            var position = JSON.parse(JSON.stringify(decoder.getPosition()));
+            position.offset++;
+            decoder.destroy();
+            var other = new streams.BlockDecoder({position: position});
+            other.on('error', function (err) {
+              assert(/offset mismatch/.test(err.message));
+              cb();
+            });
+            other.end(buf);
+          }
+        });
+        decoder.end(buf);
+      });
+      encoder.write(1);
+      encoder.write(2);
+      encoder.write(3);
+      encoder.end(4);
+    });
+
+    test('resume sync mismatch', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {writeHeader: true});
+      var bufs = [];
+      encoder.on('data', function (buf) { bufs.push(buf); });
+      encoder.on('end', function () {
+        var buf = Buffer.concat(bufs);
+        var decoder = new streams.BlockDecoder();
+        decoder.once('data', function () {
+          var position = JSON.parse(JSON.stringify(decoder.getPosition()));
+          position.sync = Array(33).join('0');
+          decoder.destroy();
+          var other = new streams.BlockDecoder({position: position});
+          other.on('error', function (err) {
+            assert(/sync marker mismatch/.test(err.message));
+            cb();
+          });
+          other.end(buf);
+        });
+        decoder.end(buf);
+      });
+      encoder.end(1);
+    });
+
+    test('resume modified block', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {blockSize: 8});
+      var bufs = [];
+      encoder.on('data', function (buf) { bufs.push(buf); });
+      encoder.on('end', function () {
+        var buf = Buffer.concat(bufs);
+        var decoder = new streams.BlockDecoder();
+        var vals = [];
+        decoder.on('data', function (val) {
+          vals.push(val);
+          if (vals.length === 1) {
+            var position = JSON.parse(JSON.stringify(decoder.getPosition()));
+            var blockOffset = position.offset;
+            // Flip a byte inside the block's data without modifying the block
+            // boundaries (count and data length are unchanged).
+            var corrupted = Buffer.from(buf);
+            corrupted[blockOffset + 4] ^= 0xff;
+            decoder.destroy();
+            var other = new streams.BlockDecoder({position: position});
+            other.on('data', function () {});
+            other.on('error', function (err) {
+              assert(/block checksum mismatch/.test(err.message));
+              cb();
+            });
+            other.end(corrupted);
+          }
+        });
+        decoder.on('error', function () {});
+        decoder.end(buf);
+      });
+      encoder.write(1);
+      encoder.write(2);
+      encoder.write(3);
+      encoder.end(4);
+    });
+
+    test('invalid position', function () {
+      var BlockDecoder = streams.BlockDecoder;
+      assert.throws(function () { new BlockDecoder({position: 'foo'}); });
+      assert.throws(function () { new BlockDecoder({position: {}}); });
+      assert.throws(function () {
+        new BlockDecoder({position: {fileId: 'a', schema: 'b'}});
+      });
+      assert.throws(function () {
+        new BlockDecoder({
+          position: {fileId: 'a', schema: 'b', block: 0, index: -1}
+        });
+      });
+    });
+
+    test('resume unreachable position', function (cb) {
+      var t = Type.forSchema('int');
+      var encoder = new streams.BlockEncoder(t, {writeHeader: true});
+      var bufs = [];
+      encoder.on('data', function (buf) { bufs.push(buf); });
+      encoder.on('end', function () {
+        var buf = Buffer.concat(bufs);
+        var decoder = new streams.BlockDecoder();
+        decoder.once('data', function () {
+          var position = JSON.parse(JSON.stringify(decoder.getPosition()));
+          position.block = 100;
+          decoder.destroy();
+          var other = new streams.BlockDecoder({position: position});
+          other.on('error', function (err) {
+            assert(/checkpoint mismatch/.test(err.message));
+            cb();
+          });
+          other.end(buf);
+        });
+        decoder.end(buf);
+      });
+      encoder.end(1);
+    });
+
   });
 
 });

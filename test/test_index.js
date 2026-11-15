@@ -79,6 +79,30 @@ suite('index', function () {
       });
   });
 
+  test('createFileDecoder resume', function (cb) {
+    var type = index.parse(path.join(DPATH, 'Person.avsc'));
+    var fpath = path.join(DPATH, 'person-10.avro');
+    var objs = [];
+    var position;
+    index.createFileDecoder(fpath)
+      .on('data', function (obj) {
+        objs.push(obj);
+        if (objs.length === 4) {
+          position = this.getPosition();
+        }
+      })
+      .on('end', function () {
+        assert.equal(objs.length, 10);
+        var resumed = [];
+        index.createFileDecoder(fpath, {position: position})
+          .on('data', function (obj) { resumed.push(obj); })
+          .on('end', function () {
+            assert.deepEqual(resumed, objs.slice(4));
+            cb();
+          });
+      });
+  });
+
   test('createFileEncoder', function (cb) {
     var type = types.Type.forSchema({
       type: 'record',
